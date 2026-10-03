@@ -1,0 +1,18 @@
+# ── 凭据：绝不提交 ────────────────────────────────────────────
+tools/provision/credentials.local.json
+*.local.json
+*.csv
+.env
+.env.*
+*.pem
+*.key
+
+# ── 依赖 ─────────────────────────────────────────────────────
+node_modules/
+
+# ── 编辑器 / 系统 ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,13 @@
+{
+  "name": "decision-model-provision",
+  "version": "1.0.0",
+  "description": "AK/SK 一键接入：发现百炼业务空间并创建/复用 API Key",
+  "main": "provision.mjs",
+  "scripts": {},
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@alicloud/modelstudio20260210": "^2.2.2",
+    "@alicloud/openapi-core": "^1.0.8"
+  }
+}
