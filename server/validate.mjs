@@ -66,12 +66,25 @@ export function validateAnswer(qid, q, a) {
     const optionNames = Object.keys(q.criteria || {});
     if (typeof a.choice !== "string" || !optionNames.includes(a.choice)) {
       problems.push(`choice 不在请求选项集内: ${JSON.stringify(a.choice)}`);
-    } else if (probValues && probValues.every((p) => typeof p === "number" && Number.isFinite(p))) {
-      // choice 必须是（并列）最大概率项，防止"硬选一个低概率选项"
+    }
+    if (isPlainObject(probs)) {
+      // 分布必须恰好覆盖请求的全部选项键，多一个少一个都不行（对齐 jev-mcp：exactly all keys）
+      const missing = optionNames.filter((k) => !(k in probs));
+      if (missing.length) problems.push(`probabilities 缺少请求的选项键: ${missing.join("、")}`);
+      const extra = Object.keys(probs).filter((k) => !optionNames.includes(k));
+      if (extra.length) problems.push(`probabilities 含请求之外的键: ${extra.join("、")}`);
+      // choice 必须是（并列）最大概率项，防止"硬选一个低概率选项"；并列容差 1e-9
       const pmax = Math.max(...probValues);
-      const pchoice = probs[a.choice];
-      if (pmax - pchoice > TIE_TOLERANCE) {
-        problems.push(`choice "${a.choice}" 的概率 ${pchoice} 不是最大项（max=${pmax}）`);
+      if (
+        typeof a.choice === "string" &&
+        optionNames.includes(a.choice) &&
+        missing.length === 0 &&
+        probValues.every((p) => Number.isFinite(p))
+      ) {
+        const pchoice = probs[a.choice];
+        if (pmax - pchoice > TIE_TOLERANCE) {
+          problems.push(`choice "${a.choice}" 的概率 ${pchoice} 不是最大项（max=${pmax}）`);
+        }
       }
     }
   } else {
@@ -79,6 +92,11 @@ export function validateAnswer(qid, q, a) {
     const max = (q.criteria?.length || 2) - 1;
     if (typeof a.score !== "number" || !Number.isFinite(a.score) || a.score < 0 || a.score > max) {
       problems.push(`score 越界: ${a.score}（合法 [0, ${max}]）`);
+    }
+    if (isPlainObject(probs)) {
+      // score 分布的键必须是合法档位索引（不允许请求之外的档位）
+      const badKeys = Object.keys(probs).filter((k) => !/^\d+$/.test(k) || Number(k) > max);
+      if (badKeys.length) problems.push(`score probabilities 存在非法档位键: ${badKeys.join("、")}`);
     }
   }
   return problems;

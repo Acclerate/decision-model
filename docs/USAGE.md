@@ -136,7 +136,7 @@ node server/test/jev-cases.mjs    # 真实 API：14 个典型用例
 }
 ```
 
-返回（上游答案经契约校验后透传；畸形答案逐问替换为 `invalid_response` 标记并汇总到顶层 `invalid_questions`）：
+返回（上游答案经契约校验后透传：概率分布必须恰好覆盖全部请求键、和为 1±0.05、choice 为最大概率项；畸形答案逐问替换为 `invalid_response` 标记并汇总到顶层 `invalid_questions`，有效答案不受影响）：
 
 ```json
 {
@@ -377,7 +377,7 @@ node server/test/grill-scorecard.mjs
 | `DECISION_REGION` | `cn` | `cn`（北京）/ `intl`（新加坡） |
 | `DECISION_AUTH_STYLE` | `bearer` | `bearer`（`Authorization: Bearer <Key>`）/ `raw`（裸 Key，部分网关需要） |
 | `DECISION_TIMEOUT_MS` | `60000` | 单次尝试的请求超时 |
-| `DECISION_MAX_ATTEMPTS` | `3` | 408/429/5xx 重试总次数（含首次），1~6；抖动指数退避（0.5s×2^n 封顶 8s）。网络层错误**不重试**（付费 POST 防双花） |
+| `DECISION_MAX_ATTEMPTS` | `3` | 408/409/429/5xx 重试总次数（含首次），1~6；抖动指数退避（0.5s×2^n 封顶 8s），600+ 视为协议噪音不重试。网络层错误**不重试**（付费 POST 防双花）；响应体超 1MB 流式中止不重试 |
 | `DECISION_MOCK` | 关闭 | `1` = 离线 mock（响应结构与真实一致，带 `mock: true` 标记），无 Key 跑通链路用 |
 
 优先级：配置文件 `env` > 系统环境变量；`DECISION_BASE_URL` > `DECISION_WORKSPACE_ID` 拼接。
@@ -389,8 +389,9 @@ node server/test/grill-scorecard.mjs
 | 命令 | 用途 |
 |---|---|
 | `node --check server/index.mjs && node --check server/bailian.mjs` | 语法自检 |
-| `node server/test/unit.mjs` | 契约校验单元测试（15 断言，无需凭据/不起 server） |
+| `node server/test/unit.mjs` | 契约校验单元测试（16 断言，无需凭据/不起 server） |
 | `node server/test/retry.test.mjs` | HTTP 重试与错误脱敏（本地假网关 4 场景，无需凭据） |
+| `node server/test/parity.mjs` | **对标测试 35 用例**（移植自 jev-mcp 测试套件）：WP1-WP5 逐包验证，离线段 + 有凭据时真实 verify/screen 配对用例 |
 | `node server/test/smoke.mjs` | mock 全链路断言（无需凭据）：握手/8 工具表/单项/批量/语义工具/错误处理 |
 | `node server/test/smoke.mjs --real` | 追加真实 API 冒烟（握手/工具表/单项/批量/错误处理） |
 | `node server/test/jev-cases.mjs` | **真实 API 14 用例集**：工单分流/风控对照/Agent 路由/LLM 质检/verify/screen/classify/unknowable 校准 |

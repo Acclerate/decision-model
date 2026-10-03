@@ -17,8 +17,11 @@
  *   DECISION_REGION       cn（默认）| intl（新加坡站）
  *   DECISION_AUTH_STYLE   bearer（默认）| raw（Authorization 只放 Key 不加 Bearer 前缀）
  *   DECISION_TIMEOUT_MS   每次尝试的请求超时毫秒，默认 60000
- *   DECISION_MAX_ATTEMPTS 408/429/5xx 的重试总次数（含首次），默认 3，范围 1~6
+ *   DECISION_MAX_ATTEMPTS 408/409/429/5xx 的重试总次数（含首次），默认 3，范围 1~6
  *   DECISION_MOCK         "1" 时离线 mock，不访问网络（响应结构与真实一致）
+ *
+ * 传输韧性（对齐 jev-mcp）：重试白名单 = 408/409/429/500~599（600+ 视为协议噪音）；
+ * 响应体流式强制 1,000,000 字节上限，超限中止且不重试；网络层错误不重试（防双花）。
  */
 
 import { validateAnswers } from "./validate.mjs";
@@ -206,9 +209,11 @@ function redact(text, secret) {
   return secret ? s.split(secret).join("***") : s;
 }
 
-/** 仅重试"可证明未被处理"或幂等安全的状态：408 请求超时、429 限流、5xx 服务端错误。
+/** 仅重试"可证明未被处理"或幂等安全的状态。重试白名单对齐 jev-mcp：408 请求超时、
+ *  409 冲突、429 限流、500~599 服务端错误；600+ 是协议噪音不是重试信号。
  *  网络层错误（连接重置/TLS）不重试——付费 POST 无幂等键，重发可能双花；其余状态码立即失败。 */
-const isRetryable = (status) => status === 408 || status === 429 || status >= 500;
+const isRetryable = (status) =>
+  status === 408 || status === 409 || status === 429 || (status >= 500 && status <= 599);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -217,9 +222,36 @@ function backoffMs(attempt) {
   return Math.min(500 * 2 ** (attempt - 1), 8_000) + Math.random() * 300;
 }
 
+/** 响应体字节上限：流式读取时强制（非缓冲后判断），超限中止且不重试（对齐 jev-mcp）。 */
+const MAX_RESPONSE_BYTES = 1_000_000;
+
+async function readBodyCapped(res) {
+  const declared = Number(res.headers.get("content-length") || 0);
+  if (declared > MAX_RESPONSE_BYTES) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`上游响应体超过 ${MAX_RESPONSE_BYTES} 字节上限（content-length: ${declared}），已中止`);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`上游响应体超过 ${MAX_RESPONSE_BYTES} 字节上限，已中止读取`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function httpCall(cfg, payload) {
   const auth = cfg.authStyle === "raw" ? cfg.apiKey : `Bearer ${cfg.apiKey}`;
   let res;
+  let text;
   let lastRetryStatus = null;
   for (let attempt = 1; ; attempt++) {
     try {
@@ -236,9 +268,10 @@ async function httpCall(cfg, payload) {
           `请用 decision_config 检查 endpoint 与网络；业务空间接入需设置 DECISION_WORKSPACE_ID`,
       );
     }
+    // 字节上限在流式读取时强制：超大响应体（含错误体）立即中止且不重试（对齐 jev-mcp）
+    text = await readBodyCapped(res);
     if (isRetryable(res.status) && attempt < cfg.maxAttempts) {
       lastRetryStatus = res.status;
-      await res.body?.cancel().catch(() => {}); // 丢弃响应体再退避
       logWarn(`HTTP ${res.status}，第 ${attempt}/${cfg.maxAttempts} 次尝试失败，退避后重试`);
       await sleep(backoffMs(attempt));
       continue;
@@ -246,7 +279,6 @@ async function httpCall(cfg, payload) {
     break;
   }
   const retriedNote = lastRetryStatus ? `（此前已重试，最后状态 ${lastRetryStatus}）` : "";
-  const text = await res.text();
   if (!res.ok) {
     let detail = redact(text.slice(0, 800), cfg.apiKey);
     try {
@@ -405,6 +437,15 @@ export async function decideChoice({ state, question, options, instructions, aut
   );
 }
 
+/** noul 机械阈值映射：P ≥ auto_accept → auto_yes；P ≤ 1−auto_accept → auto_no；中间 → review。
+ *  1−auto_accept 带 1e-9 容差：十进制下 1−0.9=0.0999…98，P=0.1 在 auto_accept=0.9 时
+ *  仍应判 auto_no（用例移植自 jev-mcp「decimal-subtraction case」）。 */
+export function noulPolicy(p, autoAccept) {
+  if (p >= autoAccept) return "auto_yes";
+  if (p <= 1 - autoAccept + 1e-9) return "auto_no";
+  return "review";
+}
+
 export async function decideNoul({ state, question, criteria, auto_accept }, cfg = loadConfig()) {
   if (typeof question !== "string" || !question.trim()) throw new Error("question 必填（字符串）");
   const autoAccept = auto_accept == null ? 0.8 : auto_accept;
@@ -417,7 +458,7 @@ export async function decideNoul({ state, question, criteria, auto_accept }, cfg
   );
   const answer = unwrapSingle(upstream);
   const p = typeof answer.noul === "number" ? answer.noul : undefined;
-  const policy = p == null ? undefined : p >= autoAccept ? "auto_yes" : p <= 1 - autoAccept ? "auto_no" : "review";
+  const policy = p == null ? undefined : noulPolicy(p, autoAccept);
   return attachMeta(
     {
       ...answer,

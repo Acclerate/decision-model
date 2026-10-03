@@ -38,9 +38,26 @@ ok("choice：概率和 0.97（两位小数舍入容差内）仍有效", () => {
     type: "choice",
     choice: "practice",
     confidence: 0.9,
-    probabilities: { review: 0.12, practice: 0.85 }, // 和 0.97，偏差 0.03 < 0.05
+    probabilities: { review: 0.12, practice: 0.85, other: 0.0 }, // 和 0.97，偏差 0.03 < 0.05
   });
   assert.deepEqual(problems, []);
+});
+
+ok("choice：分布恰好覆盖全部请求键，缺键/多键都无效", () => {
+  const missing = validateAnswer("q", CHOICE_Q, {
+    type: "choice",
+    choice: "practice",
+    confidence: 0.9,
+    probabilities: { review: 0.1, practice: 0.85 }, // 缺 other
+  });
+  assert.ok(missing.some((p) => p.includes("缺少请求的选项键")));
+  const extra = validateAnswer("q", CHOICE_Q, {
+    type: "choice",
+    choice: "practice",
+    confidence: 0.9,
+    probabilities: { review: 0.1, practice: 0.85, other: 0.04, unknown: 0.01 },
+  });
+  assert.ok(extra.some((p) => p.includes("含请求之外的键")));
 });
 
 ok("noul：P(yes)=0.87 有效", () => {

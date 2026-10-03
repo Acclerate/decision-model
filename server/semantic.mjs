@@ -22,6 +22,31 @@ function isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+// ---------------------------------------------------------------------------
+// 纯函数判定映射（导出供测试，镜像 jev-mcp lib 层的单测面；边界用例移植自其测试套件）
+// ---------------------------------------------------------------------------
+
+/** verify：confidence ≥ auto_accept（含等号）→ auto；缺失/不足一律 review。 */
+export function verifyAction(confidence, autoAccept) {
+  return confidence != null && confidence >= autoAccept ? "auto" : "review";
+}
+
+/** screen：先按 injection 概率升级（≥block_at → block，≥review_at → review），
+ *  再对无实质/不相关降级为 skip，其余 pass。 */
+export function screenRecommendation({ injection, substance, relevance, blockAt, reviewAt }) {
+  if (injection >= blockAt) return "block";
+  if (injection >= reviewAt) return "review";
+  if (substance != null && substance < 0.5) return "skip";
+  if (relevance != null && relevance < 0.5) return "skip";
+  return "pass";
+}
+
+/** classify：p_max 与 margin 双门槛同时满足（含等号）才 auto——
+ *  分类场景措辞会摆动不确定样本，高置信薄 margin 同样 review。 */
+export function classificationDecision(pMax, margin, autoAccept, minMargin) {
+  return pMax >= autoAccept && margin >= minMargin ? "auto" : "review";
+}
+
 /** 阈值参数校验：(0.5, 1] 内数值（auto_accept/block_at 类），缺省用默认值。 */
 function thresholdAboveHalf(v, def, name) {
   if (v == null) return def;
@@ -115,7 +140,7 @@ export async function decisionVerify({ claims, evidence, relations, auto_accept 
       summary.invalid++;
       continue;
     }
-    const decision = a.confidence != null && a.confidence >= threshold ? "auto" : "review";
+    const decision = verifyAction(a.confidence, threshold);
     summary[a.choice] = (summary[a.choice] ?? 0) + 1;
     if (decision === "review") summary.review++;
     results[c.id] = {
@@ -184,14 +209,14 @@ export async function decisionScreen({ text, purpose, block_at, review_at }, cfg
   let recommendation;
   if (invalid.length > 0) {
     recommendation = "review"; // 契约失败宁严勿松
-  } else if (probabilities.injection >= blockAt) {
-    recommendation = "block";
-  } else if (probabilities.injection >= reviewAt) {
-    recommendation = "review";
-  } else if (probabilities.substance < 0.5 || (probabilities.relevance != null && probabilities.relevance < 0.5)) {
-    recommendation = "skip";
   } else {
-    recommendation = "pass";
+    recommendation = screenRecommendation({
+      injection: probabilities.injection,
+      substance: probabilities.substance,
+      relevance: probabilities.relevance,
+      blockAt,
+      reviewAt,
+    });
   }
   return {
     text_length: text.length,
@@ -257,7 +282,7 @@ export async function decisionClassify({ items, classes, auto_accept, minimum_ma
     const sorted = Object.values(a.probabilities).sort((x, y) => y - x);
     const pMax = sorted[0];
     const margin = sorted.length > 1 ? pMax - sorted[1] : 1;
-    const status = pMax >= auto && margin >= marginMin ? "auto" : "review";
+    const status = classificationDecision(pMax, margin, auto, marginMin);
     summary[status]++;
     results[it.id] = {
       text: it.text,

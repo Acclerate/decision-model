@@ -211,7 +211,7 @@ npm run test:jev                  # Jev 典型用例集 14 例（真实 API）�
 ## 已知事项
 
 - **响应契约校验（fail-closed）**：每个上游答案必须通过 `server/validate.mjs` 的契约（概率分布完整且和为 1±0.05、choice 为最大概率项、数值在界内）。畸形答案逐问标记 `invalid_response` 并汇总到 `invalid_questions`，有效答案不受影响；单项工具遇到无效答案直接报错。
-- **重试与脱敏**：408/429/5xx 自动重试（抖动指数退避，`DECISION_MAX_ATTEMPTS` 默认 3 次）；网络层错误不重试（付费 POST 防双花）；所有错误文本经脱敏（API Key 替换为 `***`）后才对调用方可见。
+- **重试与脱敏**：重试白名单 408/409/429/500~599 自动重试（抖动指数退避，`DECISION_MAX_ATTEMPTS` 默认 3 次，600+ 视为协议噪音不重试）；网络层错误不重试（付费 POST 防双花）；响应体流式强制 1MB 上限、超限中止不重试；所有错误文本经脱敏（API Key 替换为 `***`）后才对调用方可见。对标用例见 `server/test/parity.mjs`。
 - **阈值参数化**：单项与语义工具的 `auto_accept`/`review_at`/`minimum_margin` 可按调用覆盖，返回 `policy`/`decision`/`status`/`recommendation` 机械映射字段；默认值与 SKILL §6 一致，执行策略仍在 skill。
 - **endpoint 必须显式配置**：`dashscope.aliyuncs.com/compatible-mode/v1/systemone` 实测 404，与微调指南 FAQ 的说法不一致，以实测与主文档（业务空间网关）为准。未配置 `DECISION_WORKSPACE_ID` 时工具会返回带修复指引的明确错误。
 - **鉴权**默认 `Bearer <Key>`；若网关要求裸 Key，设 `DECISION_AUTH_STYLE=raw`。

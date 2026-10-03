@@ -36,6 +36,7 @@
   "scripts": {
     "check": "node --check server/index.mjs && node --check server/bailian.mjs && node --check server/validate.mjs && node --check server/semantic.mjs",
     "test": "node server/test/unit.mjs && node server/test/retry.test.mjs && node server/test/smoke.mjs",
+    "test:parity": "node server/test/parity.mjs",
     "test:real": "node server/test/smoke.mjs --real",
     "test:jev": "node server/test/jev-cases.mjs"
   }
