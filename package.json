@@ -1,0 +1,42 @@
+{
+  "name": "decision-model-mcp",
+  "version": "1.1.0",
+  "description": "百炼 Decision Model（System One 协议）的 MCP 能力层：结构化决策原语 + verify/screen/classify 语义判断工具",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Acclerate/decision-model.git"
+  },
+  "bin": {
+    "decision-model-mcp": "server/index.mjs"
+  },
+  "files": [
+    "server/",
+    "skill/",
+    "docs/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "decision-model",
+    "system-one",
+    "bailian",
+    "dashscope",
+    "aliyun",
+    "llm",
+    "judgment"
+  ],
+  "scripts": {
+    "check": "node --check server/index.mjs && node --check server/bailian.mjs && node --check server/validate.mjs && node --check server/semantic.mjs",
+    "test": "node server/test/unit.mjs && node server/test/retry.test.mjs && node server/test/smoke.mjs",
+    "test:real": "node server/test/smoke.mjs --real",
+    "test:jev": "node server/test/jev-cases.mjs"
+  }
+}

@@ -12,7 +12,7 @@
 ## 目录
 
 1. [五分钟上手](#1-五分钟上手)
-2. [五个 MCP 工具详解](#2-五个-mcp-工具详解)
+2. [八个 MCP 工具详解](#2-八个-mcp-工具详解)
 3. [决策设计指南](#3-决策设计指南)
 4. [场景手册（Recipes）](#4-场景手册recipes)
 5. [配置参考](#5-配置参考)
@@ -56,8 +56,8 @@ node provision.mjs   # 默认读 D:/Documents/aliyun/aliyun_AccessKey.csv
 ```json
 "decision-model": {
   "type": "stdio",
-  "command": "node",
-  "args": ["D:\\privategit\\github\\decision-model\\server\\index.mjs"],
+  "command": "npx",
+  "args": ["-y", "decision-model-mcp"],
   "enabled": true,
   "timeoutMs": 60000,
   "env": {
@@ -67,7 +67,7 @@ node provision.mjs   # 默认读 D:/Documents/aliyun/aliyun_AccessKey.csv
 }
 ```
 
-配置里的 `env` 优先于系统环境变量。重启会话后，在 **Settings → MCP** 看到 `decision-model` 已连接、5 个工具即成功。
+配置里的 `env` 优先于系统环境变量。重启会话后，在 **Settings → MCP** 看到 `decision-model` 已连接、8 个工具即成功。（本地开发态可改用 `"command": "node", "args": ["<仓库绝对路径>/server/index.mjs"]`，不经 npm。）
 
 **Claude Desktop**（`%APPDATA%\Claude\claude_desktop_config.json`）/ **Cursor**（`~/.cursor/mcp.json`）：
 
@@ -88,7 +88,7 @@ cp -r skill/decision ~/.zcode/skills/decision    # ZCode
 
 ```bash
 node server/test/smoke.mjs        # mock 全链路（无需凭据）
-node server/test/jev-cases.mjs    # 真实 API：11 个典型用例
+node server/test/jev-cases.mjs    # 真实 API：14 个典型用例
 ```
 
 或在会话里直接问 Agent：*"用 decision_config 查看决策模型配置"*。对话式调用示例：
@@ -97,9 +97,12 @@ node server/test/jev-cases.mjs    # 真实 API：11 个典型用例
 
 ---
 
-## 2. 五个 MCP 工具详解
+## 2. 八个 MCP 工具详解
 
 客户端里的完整工具名带前缀，如 `mcp__decision-model__decide`。
+
+**协议原语**（你自己设计 questions/criteria）：`decide` / `decide_choice` / `decide_noul` / `decide_score`。
+**语义工具**（预设问题组合 + 确定性判定映射，高频判断模式直接用）：`decision_verify` / `decision_screen` / `decision_classify`。
 
 ### 2.1 `decide` — 批量决策（推荐默认）
 
@@ -133,7 +136,7 @@ node server/test/jev-cases.mjs    # 真实 API：11 个典型用例
 }
 ```
 
-返回（上游原样透传）：
+返回（上游答案经契约校验后透传；畸形答案逐问替换为 `invalid_response` 标记并汇总到顶层 `invalid_questions`）：
 
 ```json
 {
@@ -154,17 +157,59 @@ node server/test/jev-cases.mjs    # 真实 API：11 个典型用例
 
 ### 2.2 三个单项糖工具
 
-不想手写问题表时用单项版，返回上游 answer + 派生字段（`verdict`、`level`）+ `usage/latency_ms/request_id`。
+不想手写问题表时用单项版，返回上游 answer + 派生字段（`policy`、`verdict`、`level`）+ `usage/latency_ms/request_id`。
 
 | 工具 | 必填参数 | 返回 |
 |---|---|---|
-| `decide_choice` | `state`、`question`、`options`（`{名:描述}` 或名称数组）；可选 `instructions` | `choice` + `probabilities` + `confidence` |
-| `decide_noul` | `state`、`question`；可选 `criteria: {true, false}` | `noul`（P(yes)）+ `verdict`（P≥0.5 → yes） |
-| `decide_score` | `state`、`question`、`criteria`（低→高档位数组）；可选 `instructions` | `score`（概率加权期望，可落两档之间）+ `legend` + `level`（最接近档位描述）+ `confidence` |
+| `decide_choice` | `state`、`question`、`options`（`{名:描述}` 或名称数组）；可选 `instructions` | `choice` + `probabilities` + `confidence` + `policy` |
+| `decide_noul` | `state`、`question`；可选 `criteria: {true, false}` | `noul`（P(yes)）+ `verdict`（P≥0.5 → yes）+ `policy` |
+| `decide_score` | `state`、`question`、`criteria`（低→高档位数组）；可选 `instructions` | `score`（概率加权期望，可落两档之间）+ `legend` + `level`（最接近档位描述）+ `confidence` + `policy` |
 
-### 2.3 `decision_config` — 排错
+**阈值参数化**（可选，默认对齐 §3.3）：
 
-无参数。返回解析后的配置（**不含 Key 本身**）：`base_url`、`model`、`region`、`workspace_id`、`auth_style`、`timeout_ms`、`mock`、`api_key_set`。
+- `decide_choice` / `decide_score`：`auto_accept`（默认 0.8）、`review_at`（默认 0.5）→ `policy: auto / review / manual`；上游缺 `confidence` 时 policy 强制 `review`
+- `decide_noul`：`auto_accept`（默认 0.8）→ `policy: auto_yes / review / auto_no`
+
+`policy` 是机械阈值映射，不替代执行策略——高风险场景调严阈值（如 `auto_accept: 0.9`）并保留人工兜底。
+
+### 2.3 三个语义工具
+
+预设好的问题组合（question battery）+ 确定性判定映射：调用方只给业务输入，不必每次现场设计 criteria。全部一次前向、天然复用契约校验与 mock。
+
+**`decision_verify` — 断言核验（fact-check）**
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `claims` | ✓ | `[{id?, text}]` ≤16 条（每条 ≤2000 字符）：要核验的陈述句 |
+| `evidence` | ✓ | 字符串（≤50000）或 `[{id?, text}]` ≤16 项（每项 ≤20000）：判定仅依据证据 |
+| `relations` | | 覆盖默认三关系描述 `{supports, contradicts, says_nothing}` |
+| `auto_accept` | | confidence 口径的 auto 阈值，默认 0.8 |
+
+返回 `results{<断言id>: {relation, probabilities, confidence, decision: auto/review}}` + `summary` 计数。适用：报告/PR 描述 vs 引用来源、changelog vs 文档、摘要 vs 原文、Agent 简报核验。
+
+**`decision_screen` — 上下文安检**
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `text` | ✓ | 待检查文本 ≤50000 字符（抓取的网页、粘贴内容、转写稿） |
+| `purpose` | | 任务目标（≤500 字符），提供后才判定相关性 |
+| `block_at` / `review_at` | | injection 概率阈值，默认 0.75 / 0.25 |
+
+一次问三个 noul：injection（是否含指挥 AI 的注入指令）、substance（是否有实质内容）、relevance（是否与任务相关）。返回 `probabilities` + `recommendation: pass / review / block / skip`——建议非强制，执行权在调用方（低实质或低相关 → `skip`：不值得读）。
+
+**`decision_classify` — 批量打标**
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `items` | ✓ | `[{id?, text}]` ≤64 条（每条 ≤2000 字符） |
+| `classes` | ✓ | `{类别名: 描述}` 2~255 项；强描述写清定义/包含/不包含/短例；建议自带 `other` 兜底类 |
+| `auto_accept` / `minimum_margin` | | 默认 0.85 / 0.5 |
+
+目录随 state 只送一次，每条目一个独立 choice 问题。返回 `results{<条目id>: {class, probabilities, p_max, margin, status: auto/review}}`——`auto` 需 **p_max 与 margin 双门槛**（分类场景措辞会摆动不确定样本，双门槛比单门槛保守）。
+
+### 2.4 `decision_config` — 排错
+
+无参数。返回解析后的配置（**不含 Key 本身**）：`base_url`、`model`、`region`、`workspace_id`、`auth_style`、`timeout_ms`、`max_attempts`、`mock`、`api_key_set`。
 
 ---
 
@@ -186,6 +231,8 @@ node server/test/jev-cases.mjs    # 真实 API：11 个典型用例
 实测提醒：**margin 依赖 state 质量**——同一问题，state 越完整 p_max 越高（详见 §8）。
 
 ### 3.3 结果解读与执行阈值（Skill 第 6 节）
+
+单项与语义工具已内置该映射（返回 `policy` / `decision` / `status` / `recommendation` 字段，阈值可按调用覆盖，默认值同下表）；批量 `decide` 返回原始概率，逐问套用下表：
 
 对每个答案取最高选项概率 `p_top`：
 
@@ -329,7 +376,8 @@ node server/test/grill-scorecard.mjs
 | `DECISION_MODEL` | `decision-model-preview` | 模型名；可指向微调产物 `decision-model-preview-2026-09-24-ft-xxxx` |
 | `DECISION_REGION` | `cn` | `cn`（北京）/ `intl`（新加坡） |
 | `DECISION_AUTH_STYLE` | `bearer` | `bearer`（`Authorization: Bearer <Key>`）/ `raw`（裸 Key，部分网关需要） |
-| `DECISION_TIMEOUT_MS` | `60000` | 单请求超时 |
+| `DECISION_TIMEOUT_MS` | `60000` | 单次尝试的请求超时 |
+| `DECISION_MAX_ATTEMPTS` | `3` | 408/429/5xx 重试总次数（含首次），1~6；抖动指数退避（0.5s×2^n 封顶 8s）。网络层错误**不重试**（付费 POST 防双花） |
 | `DECISION_MOCK` | 关闭 | `1` = 离线 mock（响应结构与真实一致，带 `mock: true` 标记），无 Key 跑通链路用 |
 
 优先级：配置文件 `env` > 系统环境变量；`DECISION_BASE_URL` > `DECISION_WORKSPACE_ID` 拼接。
@@ -341,9 +389,11 @@ node server/test/grill-scorecard.mjs
 | 命令 | 用途 |
 |---|---|
 | `node --check server/index.mjs && node --check server/bailian.mjs` | 语法自检 |
-| `node server/test/smoke.mjs` | mock 全链路 8 步断言（无需凭据） |
+| `node server/test/unit.mjs` | 契约校验单元测试（15 断言，无需凭据/不起 server） |
+| `node server/test/retry.test.mjs` | HTTP 重试与错误脱敏（本地假网关 4 场景，无需凭据） |
+| `node server/test/smoke.mjs` | mock 全链路断言（无需凭据）：握手/8 工具表/单项/批量/语义工具/错误处理 |
 | `node server/test/smoke.mjs --real` | 追加真实 API 冒烟（握手/工具表/单项/批量/错误处理） |
-| `node server/test/jev-cases.mjs` | **真实 API 11 用例集**：工单分流/风控对照/Agent 路由/LLM 质检/批量打标/unknowable 校准 |
+| `node server/test/jev-cases.mjs` | **真实 API 14 用例集**：工单分流/风控对照/Agent 路由/LLM 质检/verify/screen/classify/unknowable 校准 |
 | `node server/test/grill-scorecard.mjs` | grill-decision 评分卡协议演示：3 选项 16 问批量 → 判别分/分类/交叉校验 |
 
 用例集自动读 `tools/provision/credentials.local.json`；重跑 provision 即可轮换凭据（ListApiKeys 复用已有 Key，不会堆积）。
@@ -362,6 +412,8 @@ node server/test/grill-scorecard.mjs
 | HTTP 401/403（鉴权问题） | Key 错误、未开通决策模型权限、网关要裸 Key | 确认 Key 归属与权限（预览版部分账号需商务开通）；试 `DECISION_AUTH_STYLE=raw` |
 | 请求超时 | 网络/代理拦截 | 设 `DECISION_TIMEOUT_MS` 加大；检查代理对 `*.maas.aliyuncs.com` 的放行 |
 | 结果像假的、带 `mock: true` | `DECISION_MOCK=1` 忘了关 | 去掉该变量重启 |
+| 某问答案带 `invalid_response: true` | 上游返回了畸形答案（preview 模型偶发） | 该问结果作废：勿使用其概率/choice；重试一次或换问题措辞；批量调用里其余有效答案不受影响 |
+| 错误消息里出现 `***` | 错误脱敏生效（上游回显了凭据） | 正常防护行为；核对 Key 是否配错环境 |
 | Settings→MCP 里 server failed | 启动即崩 | 终端直接跑 `node server/index.mjs` 看 stderr；确认 Node ≥18 与绝对路径 |
 | 工具返回 isError 文本 | 入参校验失败（如 choice 缺 criteria） | 按报错里的修复示例补参数 |
 

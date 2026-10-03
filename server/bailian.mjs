@@ -16,11 +16,15 @@
  *   DECISION_WORKSPACE_ID 业务空间 ID（走 https://{id}.cn-beijing.maas.aliyuncs.com 网关）
  *   DECISION_REGION       cn（默认）| intl（新加坡站）
  *   DECISION_AUTH_STYLE   bearer（默认）| raw（Authorization 只放 Key 不加 Bearer 前缀）
- *   DECISION_TIMEOUT_MS   请求超时毫秒，默认 60000
+ *   DECISION_TIMEOUT_MS   每次尝试的请求超时毫秒，默认 60000
+ *   DECISION_MAX_ATTEMPTS 408/429/5xx 的重试总次数（含首次），默认 3，范围 1~6
  *   DECISION_MOCK         "1" 时离线 mock，不访问网络（响应结构与真实一致）
  */
 
+import { validateAnswers } from "./validate.mjs";
+
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_ATTEMPTS = 3;
 
 export function loadConfig(env = process.env) {
   const workspace = (env.DECISION_WORKSPACE_ID || "").trim() || null;
@@ -35,6 +39,7 @@ export function loadConfig(env = process.env) {
       ? `https://${workspace}.${region === "intl" ? "ap-southeast-1" : "cn-beijing"}.maas.aliyuncs.com/compatible-mode/v1/systemone`
       : null);
   const timeout = Number(env.DECISION_TIMEOUT_MS);
+  const attempts = Number(env.DECISION_MAX_ATTEMPTS);
   return {
     baseUrl,
     workspace,
@@ -43,6 +48,8 @@ export function loadConfig(env = process.env) {
     apiKey: (env.DASHSCOPE_API_KEY || env.BAILIAN_API_KEY || "").trim(),
     authStyle: env.DECISION_AUTH_STYLE === "raw" ? "raw" : "bearer",
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_MS,
+    maxAttempts:
+      Number.isFinite(attempts) && attempts > 0 ? Math.min(6, Math.max(1, Math.round(attempts))) : DEFAULT_MAX_ATTEMPTS,
     mock: env.DECISION_MOCK === "1" || env.DECISION_MOCK === "true",
   };
 }
@@ -55,6 +62,7 @@ export function configSummary(cfg = loadConfig()) {
     workspace_id: cfg.workspace,
     auth_style: cfg.authStyle,
     timeout_ms: cfg.timeoutMs,
+    max_attempts: cfg.maxAttempts,
     mock: cfg.mock,
     api_key_set: Boolean(cfg.apiKey),
   };
@@ -156,7 +164,7 @@ function describe(v) {
 
 export async function decide(input, cfg = loadConfig()) {
   const payload = normalizeRequest(input, cfg);
-  if (cfg.mock) return mockResponse(payload);
+  if (cfg.mock) return checkResponse(mockResponse(payload), payload);
   if (!cfg.baseUrl) {
     throw new Error(
       "缺少 endpoint：决策模型走业务空间网关 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/systemone。" +
@@ -170,33 +178,82 @@ export async function decide(input, cfg = loadConfig()) {
         "也可先用 DECISION_MOCK=1 走离线 mock 验证链路。可用 decision_config 工具查看当前配置。",
     );
   }
-  return httpCall(cfg, payload);
+  return checkResponse(await httpCall(cfg, payload), payload);
+}
+
+/**
+ * 契约校验（fail-closed，规则见 validate.mjs）：无效答案逐问替换为
+ * invalid_response 标记并汇总到顶层 invalid_questions，有效答案保留。
+ */
+function checkResponse(resp, payload) {
+  if (resp == null || typeof resp !== "object") {
+    throw new Error(`上游返回了非对象响应: ${JSON.stringify(resp)?.slice(0, 200)}`);
+  }
+  const { invalid, confidenceMissing } = validateAnswers(payload.questions, resp.answers);
+  if (Object.keys(invalid).length > 0) {
+    Object.assign(resp.answers, invalid);
+    resp.invalid_questions = Object.keys(invalid);
+  }
+  if (confidenceMissing.length > 0) {
+    resp.confidence_missing = confidenceMissing;
+  }
+  return resp;
+}
+
+/** 错误文本脱敏：把 API Key 的任何出现替换为 ***（防上游回显泄漏到 MCP 可见错误里）。 */
+function redact(text, secret) {
+  const s = String(text);
+  return secret ? s.split(secret).join("***") : s;
+}
+
+/** 仅重试"可证明未被处理"或幂等安全的状态：408 请求超时、429 限流、5xx 服务端错误。
+ *  网络层错误（连接重置/TLS）不重试——付费 POST 无幂等键，重发可能双花；其余状态码立即失败。 */
+const isRetryable = (status) => status === 408 || status === 429 || status >= 500;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 抖动指数退避：500ms × 2^(n-1)，封顶 8s，加 0~300ms 抖动。 */
+function backoffMs(attempt) {
+  return Math.min(500 * 2 ** (attempt - 1), 8_000) + Math.random() * 300;
 }
 
 async function httpCall(cfg, payload) {
   const auth = cfg.authStyle === "raw" ? cfg.apiKey : `Bearer ${cfg.apiKey}`;
   let res;
-  try {
-    res = await fetch(cfg.baseUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: auth },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(cfg.timeoutMs),
-    });
-  } catch (e) {
-    throw new Error(
-      `请求百炼失败（${cfg.baseUrl}）：${e.cause?.message || e.message}。` +
-        `请用 decision_config 检查 endpoint 与网络；业务空间接入需设置 DECISION_WORKSPACE_ID`,
-    );
+  let lastRetryStatus = null;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      res = await fetch(cfg.baseUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: auth },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(cfg.timeoutMs),
+      });
+    } catch (e) {
+      // 网络层失败不重试：无法判断请求是否已被服务端处理
+      throw new Error(
+        `请求百炼失败（${cfg.baseUrl}）：${redact(e.cause?.message || e.message, cfg.apiKey)}。` +
+          `请用 decision_config 检查 endpoint 与网络；业务空间接入需设置 DECISION_WORKSPACE_ID`,
+      );
+    }
+    if (isRetryable(res.status) && attempt < cfg.maxAttempts) {
+      lastRetryStatus = res.status;
+      await res.body?.cancel().catch(() => {}); // 丢弃响应体再退避
+      logWarn(`HTTP ${res.status}，第 ${attempt}/${cfg.maxAttempts} 次尝试失败，退避后重试`);
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+    break;
   }
+  const retriedNote = lastRetryStatus ? `（此前已重试，最后状态 ${lastRetryStatus}）` : "";
   const text = await res.text();
   if (!res.ok) {
-    let detail = text.slice(0, 800);
+    let detail = redact(text.slice(0, 800), cfg.apiKey);
     try {
       const j = JSON.parse(text);
-      detail = j.message || j.error?.message || detail;
+      detail = redact(j.message || j.error?.message || detail, cfg.apiKey);
       if (j.request_id) detail += ` (request_id: ${j.request_id})`;
-    } catch { /* 保留原文 */ }
+    } catch { /* 保留原文（已脱敏） */ }
     if (res.status === 404) {
       throw new Error(
         `百炼返回 HTTP 404（endpoint 不存在）: ${cfg.baseUrl}。` +
@@ -211,13 +268,19 @@ async function httpCall(cfg, payload) {
           "另请确认该 Key 已开通决策模型访问权限。",
       );
     }
-    throw new Error(`百炼返回 HTTP ${res.status} ${res.statusText}: ${detail}`);
+    throw new Error(
+      `百炼返回 HTTP ${res.status} ${res.statusText}${retriedNote}: ${detail}`,
+    );
   }
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`百炼返回了非 JSON 响应: ${text.slice(0, 400)}`);
+    throw new Error(`百炼返回了非 JSON 响应: ${redact(text.slice(0, 400), cfg.apiKey)}`);
   }
+}
+
+function logWarn(...parts) {
+  console.error("[decision-model]", ...parts);
 }
 
 // mock：结构 1:1 对齐真实响应，便于无 Key 时跑通整条链路。
@@ -259,7 +322,9 @@ function mockAnswer(q) {
 }
 
 // ---------------------------------------------------------------------------
-// 便捷封装：单个问题。返回上游 answer + 常用派生字段（保持薄封装，不做策略）。
+// 便捷封装：单个问题。返回上游 answer + 常用派生字段。
+// policy 是机械阈值映射（auto_accept/review_at 可按调用覆盖，默认对齐 SKILL §6：
+// ≥0.8 auto / ≥0.5 review / 其余 manual），执行策略仍在 skill/调用方。
 // ---------------------------------------------------------------------------
 
 function attachMeta(answer, upstream) {
@@ -271,13 +336,52 @@ function attachMeta(answer, upstream) {
   };
 }
 
+/** sugar 工具取单问答案；契约校验未过（invalid_response）时直接抛错（isError）。 */
+function unwrapSingle(upstream) {
+  const answer = upstream.answers?.decision;
+  if (answer?.invalid_response) {
+    throw new Error(
+      `上游响应未通过契约校验（request_id: ${upstream.request_id ?? "?"}）：${answer.problems?.join("；")}`,
+    );
+  }
+  return answer;
+}
+
 function combineInstructions(question, instructions) {
   return [question, instructions].filter(Boolean).join("\n");
 }
 
-export async function decideChoice({ state, question, options, instructions }, cfg = loadConfig()) {
+/** 阈值参数校验：auto_accept ∈ (0.5,1]、review_at ∈ [0,1) 且 review_at < auto_accept。 */
+function bandParams({ auto_accept, review_at } = {}, defAuto = 0.8, defReview = 0.5) {
+  const autoAccept = auto_accept == null ? defAuto : auto_accept;
+  const reviewAt = review_at == null ? defReview : review_at;
+  if (typeof autoAccept !== "number" || !Number.isFinite(autoAccept) || autoAccept <= 0.5 || autoAccept > 1) {
+    throw new Error(`auto_accept 应为 (0.5, 1] 内数值（默认 ${defAuto}），收到 ${JSON.stringify(auto_accept)}`);
+  }
+  if (typeof reviewAt !== "number" || !Number.isFinite(reviewAt) || reviewAt < 0 || reviewAt >= 1) {
+    throw new Error(`review_at 应为 [0, 1) 内数值（默认 ${defReview}），收到 ${JSON.stringify(review_at)}`);
+  }
+  if (reviewAt >= autoAccept) throw new Error(`review_at (${reviewAt}) 必须小于 auto_accept (${autoAccept})`);
+  return { auto_accept: autoAccept, review_at: reviewAt };
+}
+
+/** 机械阈值映射：p_max → auto/review/manual。缺 confidence 强制 review（质量门仍在 skill）。 */
+function policyBand(pmax, band, confidence) {
+  if (confidence === undefined) return "review";
+  if (pmax >= band.auto_accept) return "auto";
+  if (pmax >= band.review_at) return "review";
+  return "manual";
+}
+
+const pMaxOf = (probabilities) =>
+  probabilities && Object.keys(probabilities).length > 0
+    ? Math.max(...Object.values(probabilities))
+    : undefined;
+
+export async function decideChoice({ state, question, options, instructions, auto_accept, review_at }, cfg = loadConfig()) {
   if (typeof question !== "string" || !question.trim()) throw new Error("question 必填（字符串）");
   if (instructions != null && typeof instructions !== "string") throw new Error("instructions 应为字符串");
+  const band = bandParams({ auto_accept, review_at });
   const upstream = await decide(
     {
       state,
@@ -287,26 +391,49 @@ export async function decideChoice({ state, question, options, instructions }, c
     },
     cfg,
   );
-  return attachMeta({ ...upstream.answers.decision, question }, upstream);
-}
-
-export async function decideNoul({ state, question, criteria }, cfg = loadConfig()) {
-  if (typeof question !== "string" || !question.trim()) throw new Error("question 必填（字符串）");
-  const upstream = await decide(
-    { state, questions: { decision: { type: "noul", instructions: question, criteria } } },
-    cfg,
-  );
-  const answer = upstream.answers.decision;
-  const p = typeof answer.noul === "number" ? answer.noul : undefined;
+  const answer = unwrapSingle(upstream);
+  const pmax = pMaxOf(answer.probabilities);
   return attachMeta(
-    { ...answer, question, verdict: p == null ? undefined : p >= 0.5 ? "yes" : "no" },
+    {
+      ...answer,
+      question,
+      ...(pmax !== undefined
+        ? { policy: policyBand(pmax, band, answer.confidence), thresholds: band }
+        : {}),
+    },
     upstream,
   );
 }
 
-export async function decideScore({ state, question, criteria, instructions }, cfg = loadConfig()) {
+export async function decideNoul({ state, question, criteria, auto_accept }, cfg = loadConfig()) {
+  if (typeof question !== "string" || !question.trim()) throw new Error("question 必填（字符串）");
+  const autoAccept = auto_accept == null ? 0.8 : auto_accept;
+  if (typeof autoAccept !== "number" || !Number.isFinite(autoAccept) || autoAccept <= 0.5 || autoAccept > 1) {
+    throw new Error(`auto_accept 应为 (0.5, 1] 内数值（默认 0.8），收到 ${JSON.stringify(auto_accept)}`);
+  }
+  const upstream = await decide(
+    { state, questions: { decision: { type: "noul", instructions: question, criteria } } },
+    cfg,
+  );
+  const answer = unwrapSingle(upstream);
+  const p = typeof answer.noul === "number" ? answer.noul : undefined;
+  const policy = p == null ? undefined : p >= autoAccept ? "auto_yes" : p <= 1 - autoAccept ? "auto_no" : "review";
+  return attachMeta(
+    {
+      ...answer,
+      question,
+      verdict: p == null ? undefined : p >= 0.5 ? "yes" : "no",
+      policy,
+      thresholds: { auto_accept: autoAccept },
+    },
+    upstream,
+  );
+}
+
+export async function decideScore({ state, question, criteria, instructions, auto_accept, review_at }, cfg = loadConfig()) {
   if (typeof question !== "string" || !question.trim()) throw new Error("question 必填（字符串）");
   if (instructions != null && typeof instructions !== "string") throw new Error("instructions 应为字符串");
+  const band = bandParams({ auto_accept, review_at });
   const upstream = await decide(
     {
       state,
@@ -316,13 +443,21 @@ export async function decideScore({ state, question, criteria, instructions }, c
     },
     cfg,
   );
-  const answer = upstream.answers.decision;
+  const answer = unwrapSingle(upstream);
   const legend = answer.legend || {};
   const idx = Number.isFinite(answer.score)
     ? Math.min(criteria.length - 1, Math.max(0, Math.round(answer.score)))
     : undefined;
+  const pmax = pMaxOf(answer.probabilities);
   return attachMeta(
-    { ...answer, question, level: idx == null ? undefined : legend[String(idx)] },
+    {
+      ...answer,
+      question,
+      level: idx == null ? undefined : legend[String(idx)],
+      ...(pmax !== undefined
+        ? { policy: policyBand(pmax, band, answer.confidence), thresholds: band }
+        : {}),
+    },
     upstream,
   );
 }

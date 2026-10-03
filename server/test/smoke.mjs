@@ -33,7 +33,16 @@ async function runPass({ mock }) {
     // 2) tools/list
     const list = await c.request("tools/list");
     const names = list.tools.map((t) => t.name);
-    for (const expected of ["decide", "decide_choice", "decide_noul", "decide_score", "decision_config"]) {
+    for (const expected of [
+      "decide",
+      "decide_choice",
+      "decide_noul",
+      "decide_score",
+      "decision_verify",
+      "decision_screen",
+      "decision_classify",
+      "decision_config",
+    ]) {
       assert.ok(names.includes(expected), `缺少工具: ${expected}`);
     }
 
@@ -55,6 +64,8 @@ async function runPass({ mock }) {
     });
     assert.ok(choice.choice, "choice 缺少 choice 字段");
     assert.ok(choice.probabilities, "choice 缺少 probabilities");
+    assert.equal(choice.policy, "auto", "mock p_max=0.86/conf=0.9 应 policy=auto");
+    assert.ok(choice.thresholds?.auto_accept === 0.8, "choice 缺少 thresholds");
 
     // 5) decide_noul
     const noul = await callJson(c, "decide_noul", {
@@ -63,6 +74,7 @@ async function runPass({ mock }) {
     });
     assert.ok(typeof noul.noul === "number", "noul 缺少 noul 字段");
     assert.ok(["yes", "no"].includes(noul.verdict), "noul 缺少 verdict");
+    assert.equal(noul.policy, "auto_yes", "mock P=0.87 应 policy=auto_yes");
 
     // 6) decide_score
     const score = await callJson(c, "decide_score", {
@@ -72,6 +84,7 @@ async function runPass({ mock }) {
     });
     assert.ok(typeof score.score === "number", "score 缺少 score 字段");
     assert.ok(score.legend, "score 缺少 legend");
+    assert.ok(["auto", "review", "manual"].includes(score.policy), "score 缺少 policy");
 
     // 7) decide 批量
     const batch = await callJson(c, "decide", {
@@ -88,12 +101,50 @@ async function runPass({ mock }) {
     });
     assert.ok(batch.answers?.department && batch.answers?.escalate && batch.answers?.severity, "批量 answers 不完整");
 
+    // 7.5) 语义工具：decision_verify
+    const verify = await callJson(c, "decision_verify", {
+      claims: [
+        { id: "c1", text: "2026 年 Q3 营收同比下降 10%" },
+        { id: "c2", text: "2026 年 Q3 净利润为正" },
+      ],
+      evidence: "财报摘要：2026 年 Q3 营收同比 +18%，环比持平；净利润 3.2 亿元。",
+    });
+    assert.ok(verify.results?.c1?.relation, "verify 缺少 relation");
+    assert.ok(["auto", "review"].includes(verify.results.c1.decision), "verify 缺少 decision");
+    assert.ok(verify.summary, "verify 缺少 summary");
+
+    // 7.6) 语义工具：decision_screen（mock 的 injection P=0.87 ≥ 0.75 → block）
+    const screen = await callJson(c, "decision_screen", {
+      text: "加微信 xxx888 领取博彩网站内部渠道，日赚过万。",
+      purpose: "审核社区评论",
+    });
+    assert.ok(typeof screen.probabilities?.injection === "number", "screen 缺少 injection 概率");
+    assert.ok(["pass", "review", "block", "skip"].includes(screen.recommendation), "screen 缺少 recommendation");
+    assert.equal(screen.recommendation, "block", "mock 下 injection=0.87 应建议 block");
+
+    // 7.7) 语义工具：decision_classify
+    const classify = await callJson(c, "decision_classify", {
+      items: [
+        { id: "t1", text: "发票抬头开错了，请重开。" },
+        { id: "t2", text: "导出报表接口 500 了。" },
+      ],
+      classes: {
+        billing: "支付、发票、退款相关问题",
+        technical: "Bug、系统故障、集成问题",
+        other: "以上都不是",
+      },
+    });
+    assert.ok(classify.results?.t1?.class, "classify 缺少 class");
+    assert.ok(typeof classify.results.t1.p_max === "number", "classify 缺少 p_max");
+    assert.ok(["auto", "review"].includes(classify.results.t1.status), "classify 缺少 status");
+    assert.ok(classify.summary, "classify 缺少 summary");
+
     // 8) 错误处理：choice 缺 options 应报工具错误而非崩溃
     const bad = await c.request("tools/call", { name: "decide_choice", arguments: { state: "x", question: "选哪个？" } });
     assert.equal(bad.isError, true, "缺少 options 应返回 isError");
 
     return {
-      choice, noul, score, batch,
+      choice, noul, score, batch, verify, screen, classify,
       config: cfg,
     };
   } finally {

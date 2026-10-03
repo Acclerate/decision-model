@@ -12,12 +12,17 @@ description: 通过 decision-model MCP 调用百炼 Decision Model（System One 
 | 工具 | 用途 | 返回关键字段 |
 |---|---|---|
 | `decide` | 批量决策（state + 多问题，一次前向） | `answers{<问题id>: ...}` |
-| `decide_choice` | 单项：封闭选项多选一 | `choice` + `probabilities` + `confidence` |
-| `decide_noul` | 单项：是否判断 | `noul`(P(yes)∈[0,1]) + `verdict` |
-| `decide_score` | 单项：量表打分 | `score`(概率加权期望，可落两档之间) + `legend` + `probabilities` + `confidence` |
+| `decide_choice` | 单项：封闭选项多选一 | `choice` + `probabilities` + `confidence` + `policy` |
+| `decide_noul` | 单项：是否判断 | `noul`(P(yes)∈[0,1]) + `verdict` + `policy` |
+| `decide_score` | 单项：量表打分 | `score`(概率加权期望，可落两档之间) + `legend` + `probabilities` + `policy` |
+| `decision_verify` | 断言核验：claims vs evidence，逐条独立判定 | `results{<断言id>: relation + decision}` + `summary` |
+| `decision_screen` | 文本进上下文前安检（注入/实质/相关） | `probabilities` + `recommendation`(pass/review/block/skip) |
+| `decision_classify` | 批量打标：items × 共享 classes，一次前向 | `results{<条目id>: class + p_max + margin + status}` |
 | `decision_config` | 查看解析配置（排错） | endpoint / model / mock / api_key_set |
 
 批量优先：同一个 state 上要问多件事时，用一次 `decide` 带 3~5 个问题，而不是连续调 3~5 次单项工具（延迟近线性，批量省往返）。
+
+**原语 vs 语义工具**：`decide`/`decide_*` 是协议原语（你自己设计 questions/criteria）；`decision_verify/screen/classify` 是预设好的问题组合——断言核验、上下文安检、批量打标这类高频模式直接用语义工具，别用原语重复造。
 
 ## 2. 什么时候调用，什么时候不要
 
@@ -70,6 +75,14 @@ description: 通过 decision-model MCP 调用百炼 Decision Model（System One 
 - **noul**：默认可省略 criteria；判定标准有歧义时给 `{"true": "…的情况", "false": "…的情况"}`。
 
 ## 6. 结果解读与执行阈值
+
+**工具已内置机械阈值映射**（可按调用覆盖）：单项工具返回 `policy` 字段，语义工具返回 `decision`/`status`/`recommendation`。默认值与本节一致，高风险场景可调严（如 `auto_accept: 0.9`）：
+
+- `decide_choice` / `decide_score`：`auto_accept`（默认 0.8）、`review_at`（默认 0.5）→ `policy: auto / review / manual`；缺 confidence 一律 review
+- `decide_noul`：`auto_accept`（默认 0.8）→ `policy: auto_yes / review / auto_no`
+- `decision_verify`：`auto_accept`（默认 0.8，confidence 口径）→ 每条断言 `decision: auto / review`
+- `decision_classify`：`auto_accept`（默认 0.85）+ `minimum_margin`（默认 0.5）→ 每条 `status: auto / review`
+- `decision_screen`：`block_at`（默认 0.75）、`review_at`（默认 0.25）→ `recommendation`（建议，执行权在你）
 
 对每个答案取**最高选项概率** `p_top`（score 取分布集中度）：
 
@@ -165,6 +178,8 @@ decision:
 | `DECISION_MODEL` | 模型名，默认 `decision-model-preview`；可指向微调产物 |
 | `DECISION_REGION` | `cn`（默认）/ `intl`（新加坡站） |
 | `DECISION_AUTH_STYLE` | `bearer`（默认）/ `raw`（不加 Bearer 前缀） |
+| `DECISION_TIMEOUT_MS` | 每次尝试的请求超时毫秒，默认 60000 |
+| `DECISION_MAX_ATTEMPTS` | 408/429/5xx 重试总次数（含首次），默认 3，范围 1~6；网络层错误不重试 |
 | `DECISION_MOCK` | `1` = 离线 mock，不访问网络（响应结构与真实一致） |
 
 排错顺序：先调 `decision_config` 看解析配置 → mock 通了再上真实 Key → 404 查 workspace id → 401/403 试 `DECISION_AUTH_STYLE=raw` 并确认 Key 已开通决策模型权限。

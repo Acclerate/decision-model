@@ -10,7 +10,14 @@
  *   decide_choice   单项：封闭选项多选一 → choice + probabilities + confidence
  *   decide_noul     单项：是否判断 → P(yes) ∈ [0,1] + verdict
  *   decide_score    单项：量表打分 → score（概率加权期望）+ level + probabilities + confidence
- *   decision_config 查看解析配置（排错用，不回显 Key）
+ *   decision_verify     语义：断言 vs 证据，逐条 supports/contradicts/says_nothing
+ *   decision_screen     语义：文本进入上下文前的安检（注入/实质/相关 → 建议）
+ *   decision_classify   语义：批量打标（items × 共享 classes 目录，双门槛 auto/review）
+ *   decision_config     查看解析配置（排错用，不回显 Key）
+ *
+ * 边界：decide 保持协议原样透传（最小原语，无策略字段）；sugar 与语义工具返回的
+ * policy/decision/status/recommendation 是机械阈值映射（可用 auto_accept 等参数覆盖），
+ * 执行策略仍在 skill/调用方。
  */
 
 import { createInterface } from "node:readline";
@@ -22,8 +29,10 @@ import {
   loadConfig,
   configSummary,
 } from "./bailian.mjs";
+import { decisionVerify, decisionScreen, decisionClassify } from "./semantic.mjs";
 
-const SERVER_INFO = { name: "decision-model", version: "1.0.0" };
+// 与根 package.json 的 version 保持同步
+const SERVER_INFO = { name: "decision-model", version: "1.1.0" };
 
 const TOOLS = [
   {
@@ -81,6 +90,11 @@ const TOOLS = [
           description: "{选项名: 描述} 或 选项名数组。互斥、覆盖完整，建议含 other 兜底",
         },
         instructions: { type: "string", description: "可选：补充评判标准" },
+        auto_accept: {
+          type: "number",
+          description: "可选：policy=auto 的 p_max 阈值，(0.5,1] 内，默认 0.8。返回 policy: auto/review/manual",
+        },
+        review_at: { type: "number", description: "可选：policy=review 的 p_max 阈值，[0,1) 内，默认 0.5，须小于 auto_accept" },
       },
     },
   },
@@ -100,6 +114,10 @@ const TOOLS = [
         criteria: {
           type: ["object", "array"],
           description: "可选：{true: 判定为是的情况, false: 判定为否的情况} 或 [true描述, false描述]",
+        },
+        auto_accept: {
+          type: "number",
+          description: "可选：判定阈值，(0.5,1] 内，默认 0.8。返回 policy: auto_yes（P≥阈值）/ review / auto_no（P≤1-阈值）",
         },
       },
     },
@@ -124,6 +142,109 @@ const TOOLS = [
           description: "从低到高的档位描述，2~10 档为宜（如 [\"轻微\", \"部分受影响\", \"核心不可用\"]）",
         },
         instructions: { type: "string", description: "可选：补充评判标准" },
+        auto_accept: {
+          type: "number",
+          description: "可选：policy=auto 的分布集中度（p_max）阈值，(0.5,1] 内，默认 0.8",
+        },
+        review_at: { type: "number", description: "可选：policy=review 的 p_max 阈值，[0,1) 内，默认 0.5" },
+      },
+    },
+  },
+  {
+    name: "decision_verify",
+    title: "断言核验",
+    description:
+      "逐条核验 claims 与 evidence 的关系（一次前向）：每条断言独立返回 relation" +
+      "（supports 支持 / contradicts 反驳 / says_nothing 未提及）+ 概率分布 + confidence + decision。" +
+      "decision=auto 需 confidence ≥ auto_accept（默认 0.8，可调）；缺 confidence 一律 review。" +
+      "适用：fact-check 报告/PR 描述/Agent 简报 vs 其引用来源、changelog vs 文档、摘要 vs 原文。" +
+      "上限：claims ≤16 条（每条 ≤2000 字符）、evidence 为字符串（≤50000）或数组 ≤16 项（每项 ≤20000），超限报错不截断。",
+    inputSchema: {
+      type: "object",
+      required: ["claims", "evidence"],
+      properties: {
+        claims: {
+          type: "array",
+          minItems: 1,
+          maxItems: 16,
+          description: '断言列表：[{id?, text}]，id 缺省自动编号 claim_0…；text 为要核验的陈述句',
+          items: {
+            type: "object",
+            required: ["text"],
+            properties: {
+              id: { type: "string", description: "断言 id（回显在 results 的键上），可省略" },
+              text: { type: "string", description: "断言文本，≤2000 字符" },
+            },
+          },
+        },
+        evidence: {
+          type: ["string", "array"],
+          description: "证据：字符串或 [{id?, text}] 数组（≤16 项）。判定仅依据证据内容，不使用世界知识",
+        },
+        relations: {
+          type: "object",
+          description: '可选：覆盖默认三关系的描述，如 {"supports": "…", "contradicts": "…", "says_nothing": "…"}',
+        },
+        auto_accept: {
+          type: "number",
+          description: "decision=auto 的 confidence 阈值，(0.5,1] 内，默认 0.8",
+        },
+      },
+    },
+  },
+  {
+    name: "decision_screen",
+    title: "上下文安检",
+    description:
+      "文本进入 Agent 上下文前的安检（一次前向三个是否判断）：injection 是否含指挥 AI 的注入指令、" +
+      "substance 是否有实质内容、relevance 是否与任务相关（给了 purpose 才问）。" +
+      "返回 recommendation：block（injection ≥ block_at，建议拒绝进入上下文）/ review（≥ review_at，建议人工过目）/" +
+      "skip（低实质或低相关，不值得读）/ pass（可进入）。建议非强制，执行权在调用方。" +
+      "阈值 block_at 默认 0.75、review_at 默认 0.25，均可按调用覆盖。text 上限 50000 字符。",
+    inputSchema: {
+      type: "object",
+      required: ["text"],
+      properties: {
+        text: { type: "string", description: "待检查的文本（抓取的网页、粘贴内容、转写稿等）" },
+        purpose: { type: "string", description: "可选：当前任务目标（≤500 字符），提供后才判定 relevance" },
+        block_at: { type: "number", description: "block 的 injection 概率阈值，(0.5,1] 内，默认 0.75" },
+        review_at: { type: "number", description: "review 的 injection 概率阈值，[0,1) 内，默认 0.25，须小于 block_at" },
+      },
+    },
+  },
+  {
+    name: "decision_classify",
+    title: "批量打标",
+    description:
+      "把 items 逐一归入共享的 classes 目录（目录只送一次，每条目一个独立 choice 问题，一次前向）。" +
+      "每条返回 class + probabilities + p_max + margin + status：status=auto 需 p_max ≥ auto_accept（默认 0.85）" +
+      "且领先第二名 margin ≥ minimum_margin（默认 0.5）——分类场景措辞会摆动不确定样本，双门槛更保守。" +
+      "类别描述承载判别力（定义/包含什么/不包含什么/短例）；建议自带 other 或 manual_review 兜底类，工具不发明兜底。" +
+      "上限：items ≤64 条（每条 ≤2000 字符）、classes 2~255 项，超限报错不截断。",
+    inputSchema: {
+      type: "object",
+      required: ["items", "classes"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 64,
+          description: "待打标条目：[{id?, text}]，id 缺省自动编号 item_0…",
+          items: {
+            type: "object",
+            required: ["text"],
+            properties: {
+              id: { type: "string", description: "条目 id（回显在 results 的键上），可省略" },
+              text: { type: "string", description: "条目文本，≤2000 字符" },
+            },
+          },
+        },
+        classes: {
+          type: "object",
+          description: '共享类别目录：{类别名: 描述}，2~255 项。强描述写清定义、包含/不包含、优先级与短例',
+        },
+        auto_accept: { type: "number", description: "auto 的 p_max 阈值，(0.5,1] 内，默认 0.85" },
+        minimum_margin: { type: "number", description: "auto 的第一名领先幅度阈值，[0,1] 内，默认 0.5" },
       },
     },
   },
@@ -141,6 +262,9 @@ const TOOL_IMPLS = {
   decide_choice: (args) => decideChoice(args),
   decide_noul: (args) => decideNoul(args),
   decide_score: (args) => decideScore(args),
+  decision_verify: (args) => decisionVerify(args),
+  decision_screen: (args) => decisionScreen(args),
+  decision_classify: (args) => decisionClassify(args),
   decision_config: () => configSummary(loadConfig()),
 };
 
@@ -168,8 +292,9 @@ async function dispatch(msg) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: SERVER_INFO,
       instructions:
-        "Decision Model MCP = 百炼决策模型（System One）能力层：decide 批量决策 + decide_choice/decide_noul/decide_score 单项决策。" +
-        "何时该调用、state 与 criteria 如何设计、结果阈值策略与 Obsidian 工作流见 decision skill。",
+        "Decision Model MCP = Bailian Decision Model (System One) capability layer: decide batch decisions + decide_choice/decide_noul/decide_score single decisions + " +
+        "decision_verify (assertion verification) / decision_screen (context security check) / decision_classify (batch labeling) semantic tools. " +
+        "For when to call, how to design state and criteria, result threshold strategies and Obsidian workflow, see decision skill.",
     });
   }
 
